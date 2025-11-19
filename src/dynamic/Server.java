@@ -1,167 +1,154 @@
 package dynamic;
+
 import java.io.*;
 import java.net.*;
-import java.util.*;
+import java.util.Scanner;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class Server {
-    private final int MIN = 10, MAX = 160;
-    private ThreadPoolExecutor pool;
-    private final AtomicLong totalReq = new AtomicLong();
-    private PrintWriter csvWriter;
+    private static final int MIN = 10;
+    private static final int MAX = 160;
+    private final ThreadPoolExecutor pool;
+    private final AtomicLong requestCount = new AtomicLong();
+    private PrintWriter csvLogger;
 
     public Server() {
         pool = new ThreadPoolExecutor(
-            MIN, MAX, 
-            60, TimeUnit.SECONDS,
-            new ArrayBlockingQueue<>(2000),
-            new ThreadPoolExecutor.CallerRunsPolicy()
+                MIN, MAX, 60L, TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(2000),
+                new ThreadPoolExecutor.CallerRunsPolicy()
         );
         pool.allowCoreThreadTimeOut(false);
         pool.prestartAllCoreThreads();
-        
+
         try {
-            csvWriter = new PrintWriter(new FileWriter("thread_analysis.csv", false));
-            csvWriter.println("Timestamp,PoolSize,ActiveThreads,Utilization,QueueSize,ReqPer5s,Phase,MLSuggested,TargetCalculated");
-            csvWriter.flush();
+            csvLogger = new PrintWriter(new FileWriter("thread_analysis.csv", false), true);
+            csvLogger.println("Timestamp,PoolSize,Active,Utilization,Queue,ReqDelta,ML_Suggest,Target");
         } catch (IOException e) {
-            System.err.println("Failed to initialize CSV logging");
+            System.err.println("CSV Error: " + e.getMessage());
         }
     }
 
-    public Consumer<Socket> getHandler() {
-        return client -> {
-            try (PrintWriter pw = new PrintWriter(client.getOutputStream(), true)) {
-                Thread.sleep(50); // Simulate work
-                pw.println("OK-" + totalReq.incrementAndGet());
-            } catch (Exception ignored) {
-            } finally {
-                try { client.close(); } catch (IOException ignored) {}
-            }
-        };
-    }
-
-    private void reportToML(long requestCount) {
-        try {
-            URL url = new URI("http://localhost:5000/ml/update_load/" + requestCount).toURL();
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setConnectTimeout(500);
-            conn.setReadTimeout(500);
-            conn.getResponseCode(); // Fire and forget
-            conn.disconnect();
-        } catch (Exception ignored) {}
+    private void handleClient(Socket client) {
+        try (PrintWriter out = new PrintWriter(client.getOutputStream(), true)) {
+            Thread.sleep(50);
+            out.println("OK-" + requestCount.incrementAndGet());
+        } catch (Exception ignored) {
+        } finally {
+            try { client.close(); } catch (IOException ignored) {}
+        }
     }
 
     public void startMonitor() {
         new Thread(() -> {
-            long lastTotal = 0;
+            long lastCount = 0;
             while (true) {
                 try {
                     Thread.sleep(5000);
-                    
-                    long currentTotal = totalReq.get();
-                    long requestDelta = currentTotal - lastTotal;
-                    lastTotal = currentTotal;
-                    
-                    reportToML(requestDelta);
-                    
-                    int mlSuggested = 50;
-                    String phase = "Unknown";
-                    
-                    try {
-                        URL url = new URI("http://localhost:5000/ml/suggest_threads").toURL();
-                        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                        conn.setRequestMethod("GET");
-                        conn.setConnectTimeout(1000);
-                        conn.setReadTimeout(1000);
-                        
-                        try (Scanner sc = new Scanner(conn.getInputStream())) {
-                            String response = sc.useDelimiter("\\A").next();
-                            mlSuggested = extractInt(response, "suggested_threads");
-                            phase = extractString(response, "phase");
-                        }
-                        conn.disconnect();
-                    } catch (Exception e) {
-                        // Fallback: simple reactive scaling
-                        mlSuggested = Math.max(MIN, Math.min(MAX, (int)(requestDelta / 5.0)));
-                    }
 
-                    int active = pool.getActiveCount();
-                    int poolSize = pool.getPoolSize();
-                    int currentCore = pool.getCorePoolSize();
-                    int queueSize = pool.getQueue().size();
+                    long currentCount = requestCount.get();
+                    long delta = currentCount - lastCount;
+                    lastCount = currentCount;
 
-                    // Dynamic sizing: 70% reactive (active threads) + 30% proactive (ML)
-                    int targetSize = (int)((active + 8) * 0.7 + mlSuggested * 0.3);
-                    
-                    // Queue pressure handling
-                    if (queueSize > 500) {
-                        targetSize = Math.max(targetSize, currentCore + 30);
-                    } else if (queueSize > 100) {
-                        targetSize = Math.max(targetSize, currentCore + 15);
-                    }
-                    
-                    targetSize = Math.max(MIN, Math.min(MAX, targetSize)); // Enforce bounds
+                    sendMLUpdate(delta);
+                    int mlSuggested = fetchMLSuggestion(delta);
+                    int targetSize = calculateTarget(mlSuggested);
 
-                    // Log to CSV
-                    double utilization = poolSize > 0 ? (active * 100.0 / poolSize) : 0;
-                    if (csvWriter != null) {
-                        csvWriter.printf("%d,%d,%d,%.2f,%s,%d,%d%n",
-                            System.currentTimeMillis(), poolSize, active, utilization, 
-                            phase, mlSuggested, targetSize);
-                        csvWriter.flush();
-                    }
+                    logMetrics(delta, mlSuggested, targetSize);
+                    adjustPoolSize(targetSize);
 
-                    // Resize if needed
-                    if (Math.abs(targetSize - currentCore) >= 3) {
-                        if (targetSize > currentCore) {
-                            pool.setMaximumPoolSize(targetSize);
-                            pool.setCorePoolSize(targetSize);
-                        } else {
-                            pool.setCorePoolSize(targetSize);
-                            pool.setMaximumPoolSize(targetSize);
-                        }
-                    }
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
             }
-        }, "PoolMonitor").start();
+        }).start();
     }
 
-    private int extractInt(String json, String key) {
+    private void sendMLUpdate(long count) {
         try {
-            java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("\"" + key + "\":\\s*(\\d+)").matcher(json);
-            if (m.find()) return Integer.parseInt(m.group(1));
-        } catch (Exception e) {}
-        return 0;
+            HttpURLConnection conn = (HttpURLConnection) new URI("http://localhost:5000/ml/update_load/" + count).toURL().openConnection();
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(500);
+            conn.getResponseCode();
+            conn.disconnect();
+        } catch (Exception ignored) {}
     }
 
-    private String extractString(String json, String key) {
+    private int fetchMLSuggestion(long fallbackDelta) {
         try {
-            java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("\"" + key + "\":\\s*\"([^\"]+)\"").matcher(json);
-            if (m.find()) return m.group(1);
-        } catch (Exception e) {}
-        return "Unknown";
+            HttpURLConnection conn = (HttpURLConnection) new URI("http://localhost:5000/ml/suggest_threads").toURL().openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(1000);
+
+            try (Scanner sc = new Scanner(conn.getInputStream())) {
+                String response = sc.useDelimiter("\\A").next();
+                return parseJsonInt(response, "suggested_threads");
+            }
+        } catch (Exception e) {
+            return Math.max(MIN, Math.min(MAX, (int)(fallbackDelta / 5.0)));
+        }
+    }
+
+    private int calculateTarget(int mlSuggested) {
+        int active = pool.getActiveCount();
+        int currentCore = pool.getCorePoolSize();
+        int queueSize = pool.getQueue().size();
+
+        int target = (int)((active + 8) * 0.7 + mlSuggested * 0.3);
+
+        if (queueSize > 500) {
+            target = Math.max(target, currentCore + 30);
+        } else if (queueSize > 100) {
+            target = Math.max(target, currentCore + 15);
+        }
+
+        return Math.max(MIN, Math.min(MAX, target));
+    }
+
+    private void adjustPoolSize(int target) {
+        int currentCore = pool.getCorePoolSize();
+        if (Math.abs(target - currentCore) < 3) return;
+
+        if (target > currentCore) {
+            pool.setMaximumPoolSize(target);
+            pool.setCorePoolSize(target);
+        } else {
+            pool.setCorePoolSize(target);
+            pool.setMaximumPoolSize(target);
+        }
+    }
+
+    private void logMetrics(long delta, int mlSuggested, int target) {
+        if (csvLogger == null) return;
+
+        int poolSize = pool.getPoolSize();
+        int active = pool.getActiveCount();
+        double util = poolSize > 0 ? (active * 100.0 / poolSize) : 0;
+
+        csvLogger.printf("%d,%d,%d,%.2f,%d,%d,%d,%d%n",
+                System.currentTimeMillis(), poolSize, active, util,
+                pool.getQueue().size(), delta, mlSuggested, target);
+    }
+
+    private int parseJsonInt(String json, String key) {
+        Matcher m = Pattern.compile("\"" + key + "\":\\s*(\\d+)").matcher(json);
+        return m.find() ? Integer.parseInt(m.group(1)) : 0;
     }
 
     public static void main(String[] args) {
         Server server = new Server();
         server.startMonitor();
-        
-        System.out.println("✅ Server starting on 8010...");
-        System.out.println("📊 Logging metrics to thread_analysis.csv\n");
-        
+
+        System.out.println("Server running on port 8010...");
+
         try (ServerSocket serverSocket = new ServerSocket(8010, 500)) {
             while (true) {
                 try {
                     Socket client = serverSocket.accept();
-                    server.pool.submit(() -> server.getHandler().accept(client));
+                    server.pool.submit(() -> server.handleClient(client));
                 } catch (RejectedExecutionException ignored) {}
             }
         } catch (IOException e) {

@@ -5,7 +5,6 @@ import java.io.PrintWriter;
 import java.net.Socket;
 import java.util.function.Consumer;
 
-// Named Consumer class
 public class SocketHandler implements Consumer<Socket> {
 
     @Override
