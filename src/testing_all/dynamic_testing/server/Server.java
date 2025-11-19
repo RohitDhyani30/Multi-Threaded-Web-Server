@@ -1,4 +1,4 @@
-package testing_all.dynamic_testing.server; // <-- NEW PACKAGE LINE
+package testing_all.dynamic_testing.server;
 
 import java.io.*;
 import java.net.*;
@@ -52,7 +52,7 @@ public class Server {
             conn.setRequestMethod("POST");
             conn.setConnectTimeout(500);
             conn.setReadTimeout(500);
-            conn.getResponseCode(); // Fire and forget
+            conn.getResponseCode();
             conn.disconnect();
         } catch (Exception ignored) {}
     }

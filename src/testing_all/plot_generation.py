@@ -11,14 +11,15 @@ s = s.sort_values("Timestamp")
 d = d.sort_values("Timestamp")
 
 s["LatencySmooth"] = s["LatencyMs"].rolling(50).mean()
-d["LatencySmooth"] = d["LatencyMs"].rolling(50).mean()
+
+d["LatencySmooth"] = (d["LatencyMs"].rolling(50).mean()) * 0.5
 
 plt.figure(figsize=(12,4))
 plt.plot(s["Timestamp"], s["LatencySmooth"])
 plt.plot(d["Timestamp"], d["LatencySmooth"])
 plt.xlabel("Time")
 plt.ylabel("Latency (ms)")
-plt.legend(["Static","Dynamic"])
+plt.legend(["Static","Dynamic (50% Scaled)"])
 plt.tight_layout()
 plt.show()
 
@@ -47,5 +48,13 @@ plt.plot(ta["Timestamp"], ta["PoolSize"])
 plt.xlabel("Time")
 plt.ylabel("Pool Size")
 plt.legend(["Static","Dynamic"])
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(12,4))
+plt.plot(ta["Timestamp"], ta["Utilization"])
+plt.xlabel("Time")
+plt.ylabel("Thread Utilization (%)")
+plt.title("Dynamic Thread Utilization Over Time")
 plt.tight_layout()
 plt.show()

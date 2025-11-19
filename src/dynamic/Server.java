@@ -48,7 +48,6 @@ public class Server {
             while (true) {
                 try {
                     Thread.sleep(5000);
-
                     long currentCount = requestCount.get();
                     long delta = currentCount - lastCount;
                     lastCount = currentCount;

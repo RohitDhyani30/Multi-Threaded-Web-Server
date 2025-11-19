@@ -1,3 +1,4 @@
+# ml_controller_simplified.py
 import time
 import joblib
 import torch
@@ -6,24 +7,24 @@ import numpy as np
 from flask import Flask, jsonify
 from collections import deque
 import warnings
-warnings.filterwarnings("ignore")
 
+warnings.filterwarnings("ignore")
 app = Flask(__name__)
 
-# --- Model Definition ---
+# --- Model definition (same architecture) ---
 class LSTMResidualModel(nn.Module):
     def __init__(self, input_size=1, hidden_size=64, num_layers=3, dropout=0.2):
-        super(LSTMResidualModel, self).__init__()
+        super().__init__()
         self.lstm1 = nn.LSTM(input_size, hidden_size, batch_first=True)
         self.dropout1 = nn.Dropout(dropout)
         self.lstm2 = nn.LSTM(hidden_size, hidden_size, batch_first=True)
         self.dropout2 = nn.Dropout(dropout)
-        self.lstm3 = nn.LSTM(hidden_size, hidden_size//2, batch_first=True)
+        self.lstm3 = nn.LSTM(hidden_size, hidden_size // 2, batch_first=True)
         self.dropout3 = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(hidden_size//2, 16)
+        self.fc1 = nn.Linear(hidden_size // 2, 16)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(16, 1)
-    
+
     def forward(self, x):
         out, _ = self.lstm1(x)
         out = self.dropout1(out)
@@ -31,159 +32,149 @@ class LSTMResidualModel(nn.Module):
         out = self.dropout2(out)
         out, _ = self.lstm3(out)
         out = self.dropout3(out)
-        out = out[:, -1, :]
+        out = out[:, -1, :]              # take last time step
         out = self.fc1(out)
         out = self.relu(out)
         out = self.fc2(out)
         return out
 
-# --- Model & Config Loading ---
+# --- Load models & scaler (with robust fallback) ---
 print("=" * 60)
 print("Loading Hybrid LSTM-ARIMA Model...")
+arima_model = lstm_model = scaler = None
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 try:
-    arima_model = joblib.load('hybrid_arima_component.pkl')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    arima_model = joblib.load("hybrid_arima_component.pkl")
+    scaler = joblib.load("residual_scaler.pkl")
     lstm_model = LSTMResidualModel().to(device)
-    lstm_model.load_state_dict(torch.load('hybrid_lstm_pytorch.pth', map_location=device, weights_only=True))
+    # map_location ensures CPU/GPU compatibility; corrected torch.load usage
+    lstm_state = torch.load("hybrid_lstm_pytorch.pth", map_location=device)
+    lstm_model.load_state_dict(lstm_state)
     lstm_model.eval()
-    scaler = joblib.load('residual_scaler.pkl')
-    print(f"✅ Models loaded successfully. Device: {device}")
+    print(f"✅ Models loaded. Device: {device}")
 except Exception as e:
-    print(f"⚠️  Fallback mode (models failed to load): {e}")
-    arima_model = lstm_model = scaler = None
+    print(f"⚠️  Model load failed (falling back): {e}")
 print("=" * 60)
 
+# --- Configuration & state ---
 PHASE_CONFIG = {
     "Low": {"min_req": 0, "max_req": 120, "min_threads": 10, "max_threads": 20},
     "Normal": {"min_req": 121, "max_req": 500, "min_threads": 25, "max_threads": 40},
     "High": {"min_req": 501, "max_req": 1500, "min_threads": 60, "max_threads": 100},
-    "Extreme": {"min_req": 1501, "max_req": 5000, "min_threads": 120, "max_threads": 160}
+    "Extreme": {"min_req": 1501, "max_req": 5000, "min_threads": 120, "max_threads": 160},
 }
-
 LOOKBACK_WINDOW = 20
 request_history = deque(maxlen=1000)
 last_5s_requests = deque(maxlen=LOOKBACK_WINDOW)
 
-# --- Core Logic ---
+# --- Helper functions ---
 def predict_next_load():
-    """Hybrid LSTM-ARIMA prediction with fallback"""
-    if len(last_5s_requests) < LOOKBACK_WINDOW or not arima_model:
-        if len(last_5s_requests) > 0:
-            return int(np.mean(list(last_5s_requests)[-5:]))
-        return 50 # Default startup value
-    
-    try:
-        history_array = np.array(list(last_5s_requests), dtype=float)
-        
-        # 1. ARIMA forecast
-        temp_arima = arima_model.apply(history_array)
-        arima_forecast = temp_arima.forecast(steps=1)[0]
-        fitted_values = temp_arima.fittedvalues
-        
-        if len(fitted_values) < LOOKBACK_WINDOW:
-            return max(0, int(arima_forecast))
-        
-        # 2. Calculate residuals
-        residuals = history_array[-LOOKBACK_WINDOW:] - fitted_values[-LOOKBACK_WINDOW:]
-        
-        # 3. LSTM residual prediction
-        residuals_scaled = scaler.transform(residuals.reshape(-1, 1)).flatten()
-        X_input = torch.FloatTensor(residuals_scaled).reshape(1, LOOKBACK_WINDOW, 1).to(device)
-        
-        with torch.no_grad():
-            lstm_pred_scaled = lstm_model(X_input).cpu().numpy()[0][0]
-        
-        lstm_residual_pred = scaler.inverse_transform([[lstm_pred_scaled]])[0][0]
-        
-        # 4. Hybrid prediction
-        final_prediction = arima_forecast + lstm_residual_pred
-        return max(0, int(final_prediction))
-    
-    except Exception as e:
-        return int(np.mean(list(last_5s_requests)[-5:])) if len(last_5s_requests) >= 5 else 50
+    """Return integer prediction of next 5s request count using ARIMA + LSTM residuals,
+    or fallbacks if models/data are unavailable."""
+    if len(last_5s_requests) < LOOKBACK_WINDOW or arima_model is None:
+        # warming-up fallback: simple moving average of last up to 5 windows
+        if len(last_5s_requests) >= 1:
+            recent = list(last_5s_requests)[-5:]
+            return int(max(0, np.mean(recent)))
+        return 50  # default startup value
 
-def classify_load_phase(request_count):
-    """Classify request load into phases"""
-    for phase, config in PHASE_CONFIG.items():
-        if config["min_req"] <= request_count <= config["max_req"]:
-            return phase
-    return "Extreme" if request_count > PHASE_CONFIG["Extreme"]["max_req"] else "Low"
+    try:
+        history = np.array(last_5s_requests, dtype=float)
+        arima_fit = arima_model.apply(history)
+        arima_forecast = float(arima_fit.forecast(steps=1)[0])
+        fitted = np.asarray(arima_fit.fittedvalues, dtype=float)
+
+        if len(fitted) < LOOKBACK_WINDOW:
+            return int(max(0, arima_forecast))
+
+        residuals = history[-LOOKBACK_WINDOW:] - fitted[-LOOKBACK_WINDOW:]
+
+        # scale, predict residual with LSTM, unscale
+        scaled = scaler.transform(residuals.reshape(-1, 1)).reshape(1, LOOKBACK_WINDOW, 1)
+        X = torch.from_numpy(scaled.astype(np.float32)).to(device)
+        with torch.no_grad():
+            out = lstm_model(X).cpu().numpy().squeeze()
+        lstm_resid = float(scaler.inverse_transform(out.reshape(-1, 1)).squeeze())
+
+        hybrid = arima_forecast + lstm_resid
+        return int(max(0, round(hybrid)))
+    except Exception:
+        # if anything fails, fallback to recent average
+        recent = list(last_5s_requests)[-5:] if len(last_5s_requests) >= 1 else [50]
+        return int(max(0, np.mean(recent)))
+
+def classify_load_phase(count):
+    for name, cfg in PHASE_CONFIG.items():
+        if cfg["min_req"] <= count <= cfg["max_req"]:
+            return name
+    return "Extreme" if count > PHASE_CONFIG["Extreme"]["max_req"] else "Low"
 
 def map_requests_to_threads(predicted_requests):
-    """Map predicted request count to thread pool size via linear interpolation"""
-    phase = classify_load_phase(predicted_requests)
-    config = PHASE_CONFIG[phase]
-    
-    req_range = config["max_req"] - config["min_req"]
-    thread_range = config["max_threads"] - config["min_threads"]
-    
+    cfg = PHASE_CONFIG[classify_load_phase(predicted_requests)]
+    req_range = cfg["max_req"] - cfg["min_req"]
+    thread_range = cfg["max_threads"] - cfg["min_threads"]
+
     if req_range > 0:
-        position = max(0, min(1, (predicted_requests - config["min_req"]) / req_range))
-        base_threads = config["min_threads"] + (position * thread_range)
+        position = (predicted_requests - cfg["min_req"]) / req_range
+        position = max(0.0, min(1.0, position))
+        base = cfg["min_threads"] + position * thread_range
     else:
-        base_threads = config["min_threads"]
-    
-    # Trend-based adjustment for smoother transitions
+        base = cfg["min_threads"]
+
+    # trend-based smoothing
+    adjustment = 0
     if len(last_5s_requests) >= 4:
         recent = list(last_5s_requests)[-4:]
         trend = (recent[-1] - recent[0]) / 3.0
-        
-        if trend > 150: adjustment = 10   # Sharp increase
-        elif trend > 50: adjustment = 5    # Moderate increase
-        elif trend < -150: adjustment = -10 # Sharp decrease
-        elif trend < -50: adjustment = -5   # Moderate decrease
-        else: adjustment = 0
-        base_threads += adjustment
-    
-    suggested_threads = int(round(base_threads))
-    suggested_threads = max(config["min_threads"], min(config["max_threads"], suggested_threads))
-    return max(10, min(160, suggested_threads)) # Absolute safety bounds
+        if trend > 150: adjustment = 10
+        elif trend > 50: adjustment = 5
+        elif trend < -150: adjustment = -10
+        elif trend < -50: adjustment = -5
+    base += adjustment
 
-# --- API Endpoints ---
-@app.route('/ml/update_load/<int:request_count>', methods=['POST'])
+    suggested = int(round(base))
+    suggested = max(cfg["min_threads"], min(cfg["max_threads"], suggested))
+    return max(10, min(160, suggested))
+
+# --- Flask endpoints ---
+@app.route("/ml/update_load/<int:request_count>", methods=["POST"])
 def update_load(request_count):
-    """Receive actual request count from server every 5 seconds"""
     last_5s_requests.append(request_count)
-    request_history.append({'timestamp': time.time(), 'requests': request_count})
-    return jsonify({'status': 'updated', 'history_size': len(last_5s_requests)})
+    request_history.append({"timestamp": time.time(), "requests": request_count})
+    return jsonify({"status": "updated", "history_size": len(last_5s_requests)})
 
-@app.route('/ml/suggest_threads', methods=['GET'])
+@app.route("/ml/suggest_threads", methods=["GET"])
 def suggest_threads():
-    """Generate thread pool suggestion based on hybrid prediction"""
-    current_load = last_5s_requests[-1] if len(last_5s_requests) > 0 else 0
-    predicted_requests = predict_next_load()
-    
-    decision_load = max(current_load, predicted_requests)
-    suggested_threads = map_requests_to_threads(decision_load)
-    phase = classify_load_phase(decision_load)
-    
-    # Compact logging
-    print(f"[{time.strftime('%H:%M:%S')}] Curr:{current_load:4d} | Pred:{predicted_requests:4d} | "
-          f"Phase:{phase:8s} | Threads:{suggested_threads:3d}")
-    
+    current = last_5s_requests[-1] if last_5s_requests else 0
+    predicted = predict_next_load()
+    decision = max(current, predicted)
+    threads = map_requests_to_threads(decision)
+    phase = classify_load_phase(decision)
+
+    print(f"[{time.strftime('%H:%M:%S')}] Curr:{current:4d} Pred:{predicted:4d} Phase:{phase:8s} Threads:{threads:3d}")
+
     return jsonify({
-        'suggested_threads': suggested_threads,
-        'predicted_requests': predicted_requests,
-        'current_requests': current_load,
-        'decision_load': decision_load,
-        'phase': phase,
-        'model': 'Hybrid-LSTM-ARIMA',
-        'confidence': 'high' if len(last_5s_requests) >= LOOKBACK_WINDOW else 'warming_up'
+        "suggested_threads": threads,
+        "predicted_requests": predicted,
+        "current_requests": current,
+        "decision_load": decision,
+        "phase": phase,
+        "model": "Hybrid-LSTM-ARIMA",
+        "confidence": "high" if len(last_5s_requests) >= LOOKBACK_WINDOW else "warming_up"
     })
 
-@app.route('/health', methods=['GET'])
+@app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({
-        'status': 'running',
-        'model_loaded': arima_model is not None,
-        'history_size': len(last_5s_requests)
+        "status": "running",
+        "model_loaded": arima_model is not None and lstm_model is not None and scaler is not None,
+        "history_size": len(last_5s_requests)
     })
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     print("--- ML PREDICTION SERVER (Hybrid LSTM-ARIMA) ---")
-    print("Endpoints:")
-    print("  POST /ml/update_load/<count>")
-    print("  GET  /ml/suggest_threads")
-    print("  GET  /health")
-    print(f"\n⚡ Running on http://localhost:5000\n")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    print("POST /ml/update_load/<count>")
+    print("GET  /ml/suggest_threads")
+    print("GET  /health")
+    app.run(host="0.0.0.0", port=5000, debug=False)

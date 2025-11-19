@@ -31,6 +31,5 @@ public class Client {
         System.out.println("Starting " + numClients + " continuous clients with thread pool size: " + THREAD_POOL_SIZE);
         client.startClients(numClients);
 
-        // Do not shut down the thread pool to keep clients running
     }
 }
